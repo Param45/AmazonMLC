@@ -1,0 +1,11 @@
+# Python 3.11 or 3.12 (tested on 3.11). Exact versions used to produce the submission:
+numpy==2.4.4
+pandas==3.0.2
+scipy==1.17.1
+scikit-learn==1.8.0
+lightgbm==4.7.0        # final model (MIT licence)
+rapidfuzz==3.14.6      # string similarities (MIT licence); needs >= 3.6 for process.cpdist
+matplotlib==3.10.9     # notebook charts only
+# notebook runtime (only needed for src/business_entity_resolution.ipynb)
+ipykernel==7.3.0
+jupyterlab==4.6.4
