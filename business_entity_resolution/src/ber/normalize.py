@@ -325,15 +325,17 @@ def normalize_records(df: pd.DataFrame, source: str) -> pd.DataFrame:
     """Return one row per record with every normalised view used downstream."""
     src_label = source if isinstance(source, str) else "mixed"
     names_list = _normalize_series(normalize_name, df["business_name"], f"{src_label} names")
-    addrs_list = _normalize_series(normalize_address, df["business_address"], f"{src_label} addresses")
     names = pd.DataFrame(names_list, index=df.index)
+    del names_list
+    addrs_list = _normalize_series(normalize_address, df["business_address"], f"{src_label} addresses")
     addrs = pd.DataFrame(addrs_list, index=df.index)
+    del addrs_list
+    import gc; gc.collect()
     out = pd.concat([df[["entity_id"]].copy(), names, addrs], axis=1)
+    del names, addrs
     out["source"] = source if isinstance(source, str) else list(source)
     out["country_raw"] = df["country"].values
     out["country_norm"] = [normalize_country(c) for c in df["country"]]
-    out["name_raw"] = df["business_name"].values
-    out["addr_raw"] = df["business_address"].values
     return out.reset_index(drop=True)
 
 

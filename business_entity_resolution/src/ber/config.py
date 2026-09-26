@@ -13,15 +13,14 @@ class BlockingConfig:
     # character TF-IDF on normalised names / addresses used by the FEATURES (fit per split, unsupervised)
     char_analyzer: str = "char_wb"
     char_ngram_range: tuple = (2, 4)
-    # optional separate TF-IDF for nearest-neighbour RETRIEVAL only (same as the feature vectors by default,
-    # which are then reused). E.g. (3, 4) n-grams or max_df < 1 make the vectors sparser; in tests this did
-    # not speed up the exact search enough to justify the small recall loss, so the default keeps them equal.
+    char_min_df: int = 3               # drop 1-2 occurrence noise ngrams across 12.5M rows to halve matrix RAM
+    # optional separate TF-IDF for nearest-neighbour RETRIEVAL only
     retrieval_ngram_range: tuple = (2, 4)
     retrieval_max_df: float = 1.0
     # nearest neighbours kept per Source-1 record, *per target source* (S2 and S3 separately)
-    name_k: int = 25
+    name_k: int = 20
     address_k: int = 10
-    combined_k: int = 25
+    combined_k: int = 20
     combined_name_weight: float = 0.6  # weight of name vs address in the combined retriever
     # rare-token inverted index: a token is "rare" if it occurs in <= max(rare_min_df, rare_df_frac * n_targets) targets
     rare_min_df: int = 30
@@ -35,12 +34,12 @@ class BlockingConfig:
     use_acronym_block: bool = True
     # final pruning: keep at most this many candidates per (Source-1 record, target source),
     # ranked by a cheap score. This pruned set is what the model scores (-> candidate_pairs.tsv).
-    max_candidates_per_source: int = 30
+    max_candidates_per_source: int = 20
     keep_top_name: int = 10        # ...plus the best few by name similarity alone
     keep_top_address: int = 5      # ...and by address similarity alone (only if address cosine >= 0.5)
     min_cheap_score: float = 0.05
     # exact top-k search: cells (S1 rows x targets) per chunk and per thread, and number of threads (-1 = all cores)
-    chunk_cells: int = 15_000_000
+    chunk_cells: int = 5_000_000
     n_jobs: int = -1
 
 

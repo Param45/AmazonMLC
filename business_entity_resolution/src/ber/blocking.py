@@ -231,22 +231,28 @@ def _acronym_blocker(idx: SplitIndex, positions: np.ndarray):
 
 # ----------------------------------------------------------------------------- union + prune
 def generate_candidates(idx: SplitIndex, cfg: BlockingConfig, verbose: bool = True) -> pd.DataFrame:
-    """Union of all blockers, cheap-scored and pruned. One row per candidate (s1, t) pair."""
+    """Union of all blockers, cheap-scored and pruned per source. One row per candidate (s1, t) pair."""
+    import gc
     t0 = time.time()
     name_s1, name_t = idx.mats["name_char"]
     addr_s1, addr_t = idx.mats["addr_char"]
-    parts_rows, parts_cols, parts_bits = [], [], []
-
-    def add(rows, cols, name):
-        parts_rows.append(np.asarray(rows, np.int64))
-        parts_cols.append(np.asarray(cols, np.int64))
-        parts_bits.append(np.full(len(rows), BIT[name], np.int64))
+    w = cfg.combined_name_weight
 
     timing = {}
+    source_cands = []
+    total_union = 0
+
     for src, pos in idx.source_positions.items():
         if verbose:
             print(f"[blocking] Processing target source {src} ({len(pos):,} records)...", flush=True)
         t1 = time.time()
+        parts_rows, parts_cols, parts_bits = [], [], []
+
+        def add(rows, cols, name):
+            parts_rows.append(np.asarray(rows, np.int64))
+            parts_cols.append(np.asarray(cols, np.int64))
+            parts_bits.append(np.full(len(rows), BIT[name], np.int64))
+
         knn_name, knn_addr, knn_comb = _knn_blockers(idx, pos, cfg)
         add(*knn_name, "b_name")
         add(*knn_addr, "b_addr")
@@ -264,54 +270,98 @@ def generate_candidates(idx: SplitIndex, cfg: BlockingConfig, verbose: bool = Tr
             add(*_acronym_blocker(idx, pos), "b_acr")
         timing[f"keys_{src}"] = time.time() - t1
 
-    if not parts_rows:   # no target records at all
-        parts_rows, parts_cols, parts_bits = [np.empty(0, np.int64)], [np.empty(0, np.int64)], [np.empty(0, np.int64)]
-    if verbose:
-        print("[blocking] Unioning and deduplicating candidate pairs...", flush=True)
-    rows, cols, bits = (np.concatenate(parts_rows), np.concatenate(parts_cols), np.concatenate(parts_bits))
-    keys = rows * idx.n_t + cols
-    order = np.argsort(keys, kind="stable")
-    keys, bits = keys[order], bits[order]
-    uniq, start = np.unique(keys, return_index=True)
-    bits = np.bitwise_or.reduceat(bits, start) if len(keys) else bits
-    s1, t = uniq // idx.n_t, uniq % idx.n_t
+        if not parts_rows or sum(len(x) for x in parts_rows) == 0:
+            continue
 
-    cand = pd.DataFrame({"s1": s1.astype(np.int64), "t": t.astype(np.int64), "bits": bits.astype(np.int64)})
-    cand["src"] = idx.t["source"].values[cand["t"].values]
-    for name in BLOCKERS:
-        cand[name] = ((cand["bits"].values & BIT[name]) > 0).astype(np.uint8)
-    cand["n_blocks"] = cand[BLOCKERS].sum(axis=1).astype(np.uint8)
-    n_union = len(cand)
+        if verbose:
+            print(f"[blocking {src}] Deduplicating candidate pairs...", flush=True)
+        rows = np.concatenate(parts_rows)
+        cols = np.concatenate(parts_cols)
+        bits = np.concatenate(parts_bits)
+        del parts_rows, parts_cols, parts_bits
+        gc.collect()
 
-    # cheap score: name+address cosine; name alone if an address is missing, address alone if a name is
-    ia, ib = cand["s1"].values, cand["t"].values
-    cand["name_cos"] = rowwise_dot(name_s1, name_t, ia, ib)
-    cand["addr_cos"] = rowwise_dot(addr_s1, addr_t, ia, ib)
-    w = cfg.combined_name_weight
-    addr_missing = idx.s1["addr_missing"].values[ia] | idx.t["addr_missing"].values[ib]
-    name_missing = idx.s1["name_missing"].values[ia] | idx.t["name_missing"].values[ib]
-    comb = w * cand["name_cos"].values + (1 - w) * cand["addr_cos"].values
-    cheap = np.where(addr_missing, cand["name_cos"].values, comb)
-    cand["cheap"] = np.where(name_missing, cand["addr_cos"].values, cheap).astype(np.float32)
-    # prune per (S1 record, target source). A pair survives if it ranks well on ANY of three views,
-    # so e.g. a trade-name record with a near-identical address is not lost to the name-driven ranking.
-    grp = cand.groupby(["s1", "src"])
-    cand["rank_cheap"] = grp["cheap"].rank(method="first", ascending=False).astype(np.int32)
-    rank_name = grp["name_cos"].rank(method="first", ascending=False).values
-    rank_addr = grp["addr_cos"].rank(method="first", ascending=False).values
-    protected = (cand["bits"].values & PROTECTED_BITS) > 0
-    keep = (protected
-            | ((cand["rank_cheap"].values <= cfg.max_candidates_per_source) & (cand["cheap"].values >= cfg.min_cheap_score))
-            | ((rank_name <= cfg.keep_top_name) & (cand["name_cos"].values >= cfg.min_cheap_score))
-            | ((rank_addr <= cfg.keep_top_address) & (cand["addr_cos"].values >= 0.5)))
-    cand = cand[keep].drop(columns=["bits"]).reset_index(drop=True)
+        keys = rows * idx.n_t + cols
+        order = np.argsort(keys, kind="stable")
+        keys, bits = keys[order], bits[order]
+        del order
+        gc.collect()
+
+        uniq, start = np.unique(keys, return_index=True)
+        bits = np.bitwise_or.reduceat(bits, start) if len(keys) else bits
+        s1, t = uniq // idx.n_t, uniq % idx.n_t
+        del keys, uniq, start
+        gc.collect()
+
+        src_cand = pd.DataFrame({"s1": s1.astype(np.int64), "t": t.astype(np.int64), "bits": bits.astype(np.int64)})
+        del s1, t, bits
+        gc.collect()
+
+        src_cand["src"] = src
+        for name in BLOCKERS:
+            src_cand[name] = ((src_cand["bits"].values & BIT[name]) > 0).astype(np.uint8)
+        src_cand["n_blocks"] = src_cand[BLOCKERS].sum(axis=1).astype(np.uint8)
+        n_src_union = len(src_cand)
+        total_union += n_src_union
+
+        # cheap score: name+address cosine
+        ia, ib = src_cand["s1"].values, src_cand["t"].values
+        src_cand["name_cos"] = rowwise_dot(name_s1, name_t, ia, ib)
+        src_cand["addr_cos"] = rowwise_dot(addr_s1, addr_t, ia, ib)
+        addr_missing = idx.s1["addr_missing"].values[ia] | idx.t["addr_missing"].values[ib]
+        name_missing = idx.s1["name_missing"].values[ia] | idx.t["name_missing"].values[ib]
+        comb = w * src_cand["name_cos"].values + (1 - w) * src_cand["addr_cos"].values
+        cheap = np.where(addr_missing, src_cand["name_cos"].values, comb)
+        src_cand["cheap"] = np.where(name_missing, src_cand["addr_cos"].values, cheap).astype(np.float32)
+
+        if verbose:
+            print(f"[blocking {src}] Pruning {n_src_union:,} candidates down to top-{cfg.max_candidates_per_source} per S1...", flush=True)
+
+        # Chunked pruning to avoid huge Pandas groupby.rank memory spike
+        kept_slices = []
+        chunk_step = 500_000
+        for s1_start in range(0, idx.n_s1, chunk_step):
+            s1_end = min(s1_start + chunk_step, idx.n_s1)
+            sub = src_cand[(src_cand["s1"] >= s1_start) & (src_cand["s1"] < s1_end)].copy()
+            if len(sub) == 0:
+                continue
+            grp = sub.groupby("s1")
+            rank_cheap = grp["cheap"].rank(method="first", ascending=False).values
+            rank_name = grp["name_cos"].rank(method="first", ascending=False).values
+            rank_addr = grp["addr_cos"].rank(method="first", ascending=False).values
+            protected = (sub["bits"].values & PROTECTED_BITS) > 0
+            keep = (protected
+                    | ((rank_cheap <= cfg.max_candidates_per_source) & (sub["cheap"].values >= cfg.min_cheap_score))
+                    | ((rank_name <= cfg.keep_top_name) & (sub["name_cos"].values >= cfg.min_cheap_score))
+                    | ((rank_addr <= cfg.keep_top_address) & (sub["addr_cos"].values >= 0.5)))
+            kept_slices.append(sub[keep].drop(columns=["bits"]))
+
+        del src_cand
+        gc.collect()
+
+        if kept_slices:
+            src_pruned = pd.concat(kept_slices, ignore_index=True)
+            source_cands.append(src_pruned)
+            if verbose:
+                print(f"[blocking {src}] Retained {len(src_pruned):,} candidates ({len(src_pruned)/max(n_src_union, 1):.1%})", flush=True)
+        del kept_slices
+        gc.collect()
+
+    if source_cands:
+        cand = pd.concat(source_cands, ignore_index=True)
+    else:
+        cand = pd.DataFrame(columns=["s1", "t", "src", *BLOCKERS, "n_blocks", "name_cos", "addr_cos", "cheap"])
+
     cand["s1_id"] = idx.s1["entity_id"].values[cand["s1"].values]
     cand["t_id"] = idx.t["entity_id"].values[cand["t"].values]
+    del source_cands
+    gc.collect()
+
     if verbose:
-        per = cand.groupby("s1").size()
-        print(f"[blocking] union={n_union:,} -> kept={len(cand):,} pairs | per S1: mean={per.mean():.1f}, "
+        per = cand.groupby("s1").size() if len(cand) else pd.Series([0])
+        print(f"[blocking] Total union={total_union:,} -> final kept={len(cand):,} pairs | per S1: mean={per.mean():.1f}, "
               f"p95={per.quantile(0.95):.0f}, max={per.max()} | S1 without candidates="
-              f"{idx.n_s1 - cand['s1'].nunique()} | {time.time() - t0:.1f}s")
-    cand.attrs["n_union"] = n_union
+              f"{idx.n_s1 - cand['s1'].nunique()} | {time.time() - t0:.1f}s", flush=True)
+    cand.attrs["n_union"] = total_union
     cand.attrs["timing"] = timing
     return cand

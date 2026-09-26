@@ -67,8 +67,13 @@ class SplitIndex:
 
 
 def _tfidf_pair(vec: TfidfVectorizer, a: pd.Series, b: pd.Series):
-    vec.fit(pd.concat([a, b], ignore_index=True))
-    return vec.transform(a).tocsr(), vec.transform(b).tocsr()
+    full = pd.concat([a, b], ignore_index=True)
+    vec.fit(full)
+    del full
+    import gc; gc.collect()
+    ma = vec.transform(a).tocsr()
+    mb = vec.transform(b).tocsr()
+    return ma, mb
 
 
 def build_index(data: SplitData, cfg: BlockingConfig, verbose: bool = True) -> SplitIndex:
@@ -83,10 +88,11 @@ def build_index(data: SplitData, cfg: BlockingConfig, verbose: bool = True) -> S
     positions = {src: np.flatnonzero(tn["source"].values == src) for src in sorted(tn["source"].unique())}
     idx = SplitIndex(s1=s1n, t=tn, source_positions=positions)
 
-    char = dict(analyzer=cfg.char_analyzer, ngram_range=tuple(cfg.char_ngram_range), sublinear_tf=True,
-                dtype=np.float32)
+    char_min_df = getattr(cfg, "char_min_df", 3)
+    char = dict(analyzer=cfg.char_analyzer, ngram_range=tuple(cfg.char_ngram_range),
+                min_df=char_min_df, sublinear_tf=True, dtype=np.float32)
     if verbose:
-        print("[index] Step 3/6: Fitting character TF-IDF on names and addresses...", flush=True)
+        print(f"[index] Step 3/6: Fitting character TF-IDF on names and addresses (min_df={char_min_df})...", flush=True)
     idx.mats["name_char"] = _tfidf_pair(TfidfVectorizer(**char), s1n["name_core"], tn["name_core"])
     idx.mats["addr_char"] = _tfidf_pair(TfidfVectorizer(**char), s1n["addr_core"], tn["addr_core"])
     ret = dict(char, ngram_range=tuple(cfg.retrieval_ngram_range), max_df=cfg.retrieval_max_df)
