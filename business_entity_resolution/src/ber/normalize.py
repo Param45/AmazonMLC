@@ -17,6 +17,7 @@ Design rules
 from __future__ import annotations
 
 import re
+import time
 import unicodedata
 from typing import Dict, List
 
