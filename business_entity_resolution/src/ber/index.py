@@ -34,13 +34,13 @@ def binary_matrices(lists_a: List[List[str]], lists_b: List[List[str]]) -> Tuple
             for t in sorted(set(toks)):   # sorted: vocabulary ids (and float summation order) identical run to run
                 indices.append(vocab.setdefault(t, len(vocab)))
             indptr.append(len(indices))
-        return np.asarray(indptr, dtype=np.int64), np.asarray(indices, dtype=np.int64)
+        return np.asarray(indptr, dtype=np.int32), np.asarray(indices, dtype=np.int32)
 
     pa, ia = encode(lists_a)
     pb, ib = encode(lists_b)
     n = max(len(vocab), 1)
-    a = sp.csr_matrix((np.ones(len(ia), np.float32), ia, pa), shape=(len(lists_a), n))
-    b = sp.csr_matrix((np.ones(len(ib), np.float32), ib, pb), shape=(len(lists_b), n))
+    a = sp.csr_matrix((np.ones(len(ia), np.float32), ia, pa), shape=(len(lists_a), n), dtype=np.float32)
+    b = sp.csr_matrix((np.ones(len(ib), np.float32), ib, pb), shape=(len(lists_b), n), dtype=np.float32)
     return a, b, vocab
 
 
@@ -82,11 +82,21 @@ def build_index(data: SplitData, cfg: BlockingConfig, verbose: bool = True) -> S
     if verbose:
         print(f"[index] Step 1/6: Normalizing Source-1 records ({len(data.s1):,} rows)...", flush=True)
     s1n = normalize_records(data.s1, "S1")
-    targets = data.targets
+
+    n_targets = len(data.s2) + len(data.s3)
     if verbose:
-        print(f"[index] Step 2/6: Normalizing Target records ({len(targets):,} rows across S2/S3)...", flush=True)
-    tn = normalize_records(targets, targets["source"])
-    positions = {src: np.flatnonzero(tn["source"].values == src) for src in sorted(tn["source"].unique())}
+        print(f"[index] Step 2/6: Normalizing Target records ({n_targets:,} rows: {len(data.s2):,} S2 + {len(data.s3):,} S3)...", flush=True)
+    s2n = normalize_records(data.s2, "S2")
+    s3n = normalize_records(data.s3, "S3")
+    len_s2 = len(s2n)
+    tn = pd.concat([s2n, s3n], ignore_index=True)
+    del s2n, s3n
+    import gc; gc.collect()
+
+    positions = {
+        "S2": np.arange(len_s2, dtype=np.int64),
+        "S3": np.arange(len_s2, len(tn), dtype=np.int64)
+    }
     idx = SplitIndex(s1=s1n, t=tn, source_positions=positions)
 
     char_min_df = getattr(cfg, "char_min_df", 3)

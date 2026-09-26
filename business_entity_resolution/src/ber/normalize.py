@@ -303,41 +303,52 @@ def normalize_country(raw) -> str:
     return " ".join(merge_initials(_RE_NON_WORD.sub(" ", fold(raw)).split()))
 
 
-def _normalize_series(fn, series: pd.Series, desc: str, log_interval: int = 250_000) -> List[dict]:
-    n = len(series)
-    out = []
+def normalize_records(df: pd.DataFrame, source: str, chunk_size: int = 500_000) -> pd.DataFrame:
+    """Return one row per record with every normalised view used downstream.
+
+    Processes in chunks of 500,000 to keep peak memory under 1 GB during normalization.
+    """
+    import gc
+    n = len(df)
+    src_label = source if isinstance(source, str) else "targets"
+    chunks = []
     t0 = time.time()
-    last_log = t0
-    for i, x in enumerate(series):
-        out.append(fn(x))
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        sub = df.iloc[start:end]
+
+        names_chunk = pd.DataFrame([normalize_name(x) for x in sub["business_name"]])
+        addrs_chunk = pd.DataFrame([normalize_address(x) for x in sub["business_address"]])
+
+        chunk_out = pd.concat([
+            sub[["entity_id"]].reset_index(drop=True),
+            names_chunk,
+            addrs_chunk
+        ], axis=1)
+
+        del names_chunk, addrs_chunk
+
+        src_sub = source if isinstance(source, str) else sub["source"].values
+        chunk_out["source"] = src_sub
+        chunk_out["country_raw"] = sub["country"].values
+        chunk_out["country_norm"] = [normalize_country(c) for c in sub["country"]]
+
+        chunks.append(chunk_out)
+        del chunk_out
+        gc.collect()
+
         now = time.time()
-        if (i + 1) % log_interval == 0 or (i + 1) == n or (now - last_log >= 15.0):
-            elapsed = now - t0
-            speed = (i + 1) / max(elapsed, 0.001)
-            pct = ((i + 1) / n) * 100
-            eta = (n - (i + 1)) / max(speed, 1.0)
-            print(f"[normalize] {desc}: {i+1:,}/{n:,} ({pct:.1f}%) | {speed:,.0f} rows/s | ETA: {eta:.0f}s", flush=True)
-            last_log = now
+        elapsed = now - t0
+        speed = end / max(elapsed, 0.001)
+        pct = (end / n) * 100
+        eta = (n - end) / max(speed, 1.0)
+        print(f"[normalize] {src_label}: {end:,}/{n:,} ({pct:.1f}%) | {speed:,.0f} rows/s | ETA: {eta:.0f}s", flush=True)
+
+    out = pd.concat(chunks, ignore_index=True)
+    del chunks
+    gc.collect()
     return out
-
-
-# ----------------------------------------------------------------------------- tables
-def normalize_records(df: pd.DataFrame, source: str) -> pd.DataFrame:
-    """Return one row per record with every normalised view used downstream."""
-    src_label = source if isinstance(source, str) else "mixed"
-    names_list = _normalize_series(normalize_name, df["business_name"], f"{src_label} names")
-    names = pd.DataFrame(names_list, index=df.index)
-    del names_list
-    addrs_list = _normalize_series(normalize_address, df["business_address"], f"{src_label} addresses")
-    addrs = pd.DataFrame(addrs_list, index=df.index)
-    del addrs_list
-    import gc; gc.collect()
-    out = pd.concat([df[["entity_id"]].copy(), names, addrs], axis=1)
-    del names, addrs
-    out["source"] = source if isinstance(source, str) else list(source)
-    out["country_raw"] = df["country"].values
-    out["country_norm"] = [normalize_country(c) for c in df["country"]]
-    return out.reset_index(drop=True)
 
 
 def examples_table(values, kind: str = "name") -> pd.DataFrame:
