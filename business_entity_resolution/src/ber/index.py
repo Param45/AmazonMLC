@@ -6,6 +6,7 @@ countries that never appear in training.
 """
 from __future__ import annotations
 
+import gc
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
@@ -24,23 +25,50 @@ def _split_words(text: str) -> List[str]:
     return text.split()
 
 
-def binary_matrices(lists_a: List[List[str]], lists_b: List[List[str]]) -> Tuple[sp.csr_matrix, sp.csr_matrix, Dict[str, int]]:
-    """Binary bag-of-tokens matrices for two record sets over one shared vocabulary."""
+def binary_matrices(lists_a, lists_b, batch_size: int = 500_000) -> Tuple[sp.csr_matrix, sp.csr_matrix, Dict[str, int]]:
+    """Binary bag-of-tokens matrices for two record sets over one shared vocabulary.
+
+    Streams encoding in chunks to avoid generating tens of millions of Python list items.
+    """
     vocab: Dict[str, int] = {}
 
-    def encode(lists):
-        indptr, indices = [0], []
-        for toks in lists:
-            for t in sorted(set(toks)):   # sorted: vocabulary ids (and float summation order) identical run to run
-                indices.append(vocab.setdefault(t, len(vocab)))
-            indptr.append(len(indices))
-        return np.asarray(indptr, dtype=np.int32), np.asarray(indices, dtype=np.int32)
+    for toks in lists_a:
+        for t in toks:
+            if t not in vocab:
+                vocab[t] = len(vocab)
+    for toks in lists_b:
+        for t in toks:
+            if t not in vocab:
+                vocab[t] = len(vocab)
 
-    pa, ia = encode(lists_a)
-    pb, ib = encode(lists_b)
-    n = max(len(vocab), 1)
-    a = sp.csr_matrix((np.ones(len(ia), np.float32), ia, pa), shape=(len(lists_a), n), dtype=np.float32)
-    b = sp.csr_matrix((np.ones(len(ib), np.float32), ib, pb), shape=(len(lists_b), n), dtype=np.float32)
+    n_vocab = max(len(vocab), 1)
+
+    def encode_chunks(lists):
+        n = len(lists)
+        chunks = []
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            sub_lists = lists[start:end] if isinstance(lists, list) else lists.iloc[start:end]
+            indptr = [0]
+            indices = []
+            for toks in sub_lists:
+                for t in sorted(set(toks)):
+                    idx_val = vocab.get(t)
+                    if idx_val is not None:
+                        indices.append(idx_val)
+                indptr.append(len(indices))
+            pa = np.asarray(indptr, dtype=np.int32)
+            ia = np.asarray(indices, dtype=np.int32)
+            data = np.ones(len(ia), dtype=np.float32)
+            chunk_csr = sp.csr_matrix((data, ia, pa), shape=(len(sub_lists), n_vocab), dtype=np.float32)
+            chunks.append(chunk_csr)
+        if len(chunks) == 1:
+            return chunks[0]
+        return sp.vstack(chunks, format="csr")
+
+    a = encode_chunks(lists_a)
+    b = encode_chunks(lists_b)
+    gc.collect()
     return a, b, vocab
 
 
@@ -67,13 +95,42 @@ class SplitIndex:
         return len(self.t)
 
 
-def _tfidf_pair(vec: TfidfVectorizer, a: pd.Series, b: pd.Series):
-    full = pd.concat([a, b], ignore_index=True)
-    vec.fit(full)
-    del full
-    import gc; gc.collect()
-    ma = vec.transform(a).tocsr()
-    mb = vec.transform(b).tocsr()
+def _transform_batches(vec: TfidfVectorizer, s: pd.Series, batch_size: int = 500_000) -> sp.csr_matrix:
+    chunks = []
+    n = len(s)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        chunk_mat = vec.transform(s.iloc[start:end])
+        chunks.append(chunk_mat)
+    if len(chunks) == 1:
+        return chunks[0].tocsr()
+    return sp.vstack(chunks, format="csr")
+
+
+def _tfidf_pair(vec: TfidfVectorizer, a: pd.Series, b: pd.Series, sample_size: int = 1_000_000):
+    """Fits vocabulary & IDF on a representative sample (or full data if small),
+
+    then transforms in batches of 500k rows to avoid massive Python list memory spikes.
+    """
+    total_len = len(a) + len(b)
+    if total_len <= sample_size:
+        full = pd.concat([a, b], ignore_index=True)
+        vec.fit(full)
+        del full
+    else:
+        # Fit on a stratified/proportional sample to stay well within RAM limits
+        n_a = min(len(a), int(sample_size * (len(a) / total_len)))
+        n_b = min(len(b), sample_size - n_a)
+        sa = a.sample(n=n_a, random_state=42)
+        sb = b.sample(n=n_b, random_state=42)
+        sample = pd.concat([sa, sb], ignore_index=True)
+        vec.fit(sample)
+        del sample, sa, sb
+    gc.collect()
+
+    ma = _transform_batches(vec, a)
+    mb = _transform_batches(vec, b)
+    gc.collect()
     return ma, mb
 
 
@@ -91,7 +148,13 @@ def build_index(data: SplitData, cfg: BlockingConfig, verbose: bool = True) -> S
     len_s2 = len(s2n)
     tn = pd.concat([s2n, s3n], ignore_index=True)
     del s2n, s3n
-    import gc; gc.collect()
+    gc.collect()
+
+    # Free raw text columns from input dataframes to release 6-8 GB RAM
+    data.s1 = data.s1[["entity_id", "country"]]
+    data.s2 = data.s2[["entity_id", "country"]]
+    data.s3 = data.s3[["entity_id", "country"]]
+    gc.collect()
 
     positions = {
         "S2": np.arange(len_s2, dtype=np.int64),
@@ -99,7 +162,7 @@ def build_index(data: SplitData, cfg: BlockingConfig, verbose: bool = True) -> S
     }
     idx = SplitIndex(s1=s1n, t=tn, source_positions=positions)
 
-    char_min_df = getattr(cfg, "char_min_df", 3)
+    char_min_df = getattr(cfg, "char_min_df", 5)
     char = dict(analyzer=cfg.char_analyzer, ngram_range=tuple(cfg.char_ngram_range),
                 min_df=char_min_df, sublinear_tf=True, dtype=np.float32)
     if verbose:
@@ -121,25 +184,48 @@ def build_index(data: SplitData, cfg: BlockingConfig, verbose: bool = True) -> S
 
     if verbose:
         print("[index] Step 5/6: Building name token & skeleton binary matrices...", flush=True)
-    a, b, _ = binary_matrices(s1n["name_tokens"].tolist(), tn["name_tokens"].tolist())
+    a, b, _ = binary_matrices(s1n["name_tokens"], tn["name_tokens"])
     idx.mats["name_tok"], idx.idf["name_tok"] = (a, b), smooth_idf(a, b)
-    a, b, _ = binary_matrices(s1n["name_skel"].tolist(), tn["name_skel"].tolist())
+    del a, b
+    gc.collect()
+
+    a, b, _ = binary_matrices(s1n["name_skel"], tn["name_skel"])
     idx.mats["name_skel"] = (a, b)
+    del a, b
+    gc.collect()
 
     if verbose:
         print("[index] Step 6/6: Building address token & postal matrices...", flush=True)
     # address tokens and "tail" tokens share one vocabulary so tail-vs-address coverage can be computed
-    a_lists = s1n["addr_tokens"].tolist() + s1n["addr_tail"].tolist()
-    b_lists = tn["addr_tokens"].tolist() + tn["addr_tail"].tolist()
+    a_lists = pd.concat([s1n["addr_tokens"], s1n["addr_tail"]], ignore_index=True)
+    b_lists = pd.concat([tn["addr_tokens"], tn["addr_tail"]], ignore_index=True)
     a, b, _ = binary_matrices(a_lists, b_lists)
+    del a_lists, b_lists
+    gc.collect()
+
     n1, n2 = len(s1n), len(tn)
     idx.mats["addr_tok"] = (a[:n1], b[:n2])
     idx.mats["addr_tail"] = (a[n1:], b[n2:])
     idx.idf["addr_tok"] = smooth_idf(a[:n1], b[:n2])
-    a, b, _ = binary_matrices(s1n["addr_numbers"].tolist(), tn["addr_numbers"].tolist())
+    del a, b
+    gc.collect()
+
+    a, b, _ = binary_matrices(s1n["addr_numbers"], tn["addr_numbers"])
     idx.mats["addr_num"] = (a, b)
-    a, b, _ = binary_matrices(s1n["addr_postal"].tolist(), tn["addr_postal"].tolist())
+    del a, b
+    gc.collect()
+
+    a, b, _ = binary_matrices(s1n["addr_postal"], tn["addr_postal"])
     idx.mats["addr_postal"] = (a, b)
+    del a, b
+    gc.collect()
+
+    # Free columns from s1n and tn that are never used downstream to save ~5 GB RAM
+    unused_cols = ["addr_tokens", "addr_tail", "addr_numbers", "country_raw", "addr_clean"]
+    s1n.drop(columns=[c for c in unused_cols if c in s1n.columns], inplace=True)
+    tn.drop(columns=[c for c in unused_cols if c in tn.columns], inplace=True)
+    gc.collect()
+
     if verbose:
         sizes = ", ".join(f"{k}={len(v)}" for k, v in positions.items())
         print(f"[index] Completed in {time.time() - t0:.1f}s | S1={n1:,}, targets={n2:,} ({sizes}); vocab={idx.mats['name_char'][0].shape[1]:,}", flush=True)
