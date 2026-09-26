@@ -83,6 +83,8 @@ def _group_context(df: pd.DataFrame, keys: List[str], score: np.ndarray, prefix:
 
 def build_features(idx: SplitIndex, cand: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     t0 = time.time()
+    if verbose:
+        print(f"[features] Computing ~85 pairwise features for {len(cand):,} candidate pairs...", flush=True)
     ia, ib = cand["s1"].to_numpy(), cand["t"].to_numpy()
     s1, t = idx.s1, idx.t
     f: dict = {}
@@ -91,6 +93,8 @@ def build_features(idx: SplitIndex, cand: pd.DataFrame, verbose: bool = True) ->
         return df[name].to_numpy()[ia] if df is s1 else df[name].to_numpy()[ib]
 
     # ---------------------------------------------------------------- names
+    if verbose:
+        print("[features] 1/4: Name similarities & RapidFuzz distances...", flush=True)
     n1c, n2c = col(s1, "name_core"), col(t, "name_core")
     n_miss = col(s1, "name_missing") | col(t, "name_missing")
     f["name_char_cos"] = cand["name_cos"].to_numpy()
@@ -144,6 +148,8 @@ def build_features(idx: SplitIndex, cand: pd.DataFrame, verbose: bool = True) ->
     f["name_missing_t"] = col(t, "name_missing").astype(np.float32)
 
     # ---------------------------------------------------------------- addresses
+    if verbose:
+        print("[features] 2/4: Address similarities & locality tails...", flush=True)
     a1c, a2c = col(s1, "addr_core"), col(t, "addr_core")
     a_miss = col(s1, "addr_missing") | col(t, "addr_missing")
     f["addr_char_cos"] = cand["addr_cos"].to_numpy()
@@ -185,6 +191,8 @@ def build_features(idx: SplitIndex, cand: pd.DataFrame, verbose: bool = True) ->
     f["landmark_t"] = col(t, "addr_landmark").astype(np.float32)
 
     # ---------------------------------------------------------------- metadata
+    if verbose:
+        print("[features] 3/4: Metadata & blocker features...", flush=True)
     c1, c2 = col(s1, "country_norm"), col(t, "country_norm")
     f["country_eq"] = np.where((c1 != "") & (c2 != ""), c1 == c2, np.nan).astype(np.float32)
     f["target_is_s3"] = (cand["src"].to_numpy() == "S3").astype(np.float32)
@@ -194,6 +202,8 @@ def build_features(idx: SplitIndex, cand: pd.DataFrame, verbose: bool = True) ->
     f["cheap_score"] = cand["cheap"].to_numpy().astype(np.float32)
 
     # ---------------------------------------------------------------- competition / context
+    if verbose:
+        print("[features] 4/4: Context & mutual competition rank features...", flush=True)
     base = cand[["s1", "t", "src"]].copy()
     cheap = cand["cheap"].to_numpy().astype(np.float64)
     # blended name similarity (token_set alone saturates at 1.0 for subset names like "Rao Pharma")

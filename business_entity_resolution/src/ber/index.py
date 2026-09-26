@@ -72,14 +72,21 @@ def _tfidf_pair(vec: TfidfVectorizer, a: pd.Series, b: pd.Series):
 
 
 def build_index(data: SplitData, cfg: BlockingConfig, verbose: bool = True) -> SplitIndex:
+    t0 = time.time()
+    if verbose:
+        print(f"[index] Step 1/6: Normalizing Source-1 records ({len(data.s1):,} rows)...", flush=True)
     s1n = normalize_records(data.s1, "S1")
     targets = data.targets
+    if verbose:
+        print(f"[index] Step 2/6: Normalizing Target records ({len(targets):,} rows across S2/S3)...", flush=True)
     tn = normalize_records(targets, targets["source"])
     positions = {src: np.flatnonzero(tn["source"].values == src) for src in sorted(tn["source"].unique())}
     idx = SplitIndex(s1=s1n, t=tn, source_positions=positions)
 
     char = dict(analyzer=cfg.char_analyzer, ngram_range=tuple(cfg.char_ngram_range), sublinear_tf=True,
                 dtype=np.float32)
+    if verbose:
+        print("[index] Step 3/6: Fitting character TF-IDF on names and addresses...", flush=True)
     idx.mats["name_char"] = _tfidf_pair(TfidfVectorizer(**char), s1n["name_core"], tn["name_core"])
     idx.mats["addr_char"] = _tfidf_pair(TfidfVectorizer(**char), s1n["addr_core"], tn["addr_core"])
     ret = dict(char, ngram_range=tuple(cfg.retrieval_ngram_range), max_df=cfg.retrieval_max_df)
@@ -88,14 +95,22 @@ def build_index(data: SplitData, cfg: BlockingConfig, verbose: bool = True) -> S
     else:
         idx.mats["name_ret"] = _tfidf_pair(TfidfVectorizer(**ret), s1n["name_core"], tn["name_core"])
         idx.mats["addr_ret"] = _tfidf_pair(TfidfVectorizer(**ret), s1n["addr_core"], tn["addr_core"])
+
     word = dict(analyzer=_split_words, sublinear_tf=True, dtype=np.float32)
+    if verbose:
+        print("[index] Step 4/6: Fitting word TF-IDF on names and addresses...", flush=True)
     idx.mats["name_word"] = _tfidf_pair(TfidfVectorizer(**word), s1n["name_core"], tn["name_core"])
     idx.mats["addr_word"] = _tfidf_pair(TfidfVectorizer(**word), s1n["addr_core"], tn["addr_core"])
 
+    if verbose:
+        print("[index] Step 5/6: Building name token & skeleton binary matrices...", flush=True)
     a, b, _ = binary_matrices(s1n["name_tokens"].tolist(), tn["name_tokens"].tolist())
     idx.mats["name_tok"], idx.idf["name_tok"] = (a, b), smooth_idf(a, b)
     a, b, _ = binary_matrices(s1n["name_skel"].tolist(), tn["name_skel"].tolist())
     idx.mats["name_skel"] = (a, b)
+
+    if verbose:
+        print("[index] Step 6/6: Building address token & postal matrices...", flush=True)
     # address tokens and "tail" tokens share one vocabulary so tail-vs-address coverage can be computed
     a_lists = s1n["addr_tokens"].tolist() + s1n["addr_tail"].tolist()
     b_lists = tn["addr_tokens"].tolist() + tn["addr_tail"].tolist()
@@ -110,5 +125,5 @@ def build_index(data: SplitData, cfg: BlockingConfig, verbose: bool = True) -> S
     idx.mats["addr_postal"] = (a, b)
     if verbose:
         sizes = ", ".join(f"{k}={len(v)}" for k, v in positions.items())
-        print(f"[index] S1={n1}, targets={n2} ({sizes}); name char vocab={idx.mats['name_char'][0].shape[1]}")
+        print(f"[index] Completed in {time.time() - t0:.1f}s | S1={n1:,}, targets={n2:,} ({sizes}); vocab={idx.mats['name_char'][0].shape[1]:,}", flush=True)
     return idx

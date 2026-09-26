@@ -302,11 +302,32 @@ def normalize_country(raw) -> str:
     return " ".join(merge_initials(_RE_NON_WORD.sub(" ", fold(raw)).split()))
 
 
+def _normalize_series(fn, series: pd.Series, desc: str, log_interval: int = 250_000) -> List[dict]:
+    n = len(series)
+    out = []
+    t0 = time.time()
+    last_log = t0
+    for i, x in enumerate(series):
+        out.append(fn(x))
+        now = time.time()
+        if (i + 1) % log_interval == 0 or (i + 1) == n or (now - last_log >= 15.0):
+            elapsed = now - t0
+            speed = (i + 1) / max(elapsed, 0.001)
+            pct = ((i + 1) / n) * 100
+            eta = (n - (i + 1)) / max(speed, 1.0)
+            print(f"[normalize] {desc}: {i+1:,}/{n:,} ({pct:.1f}%) | {speed:,.0f} rows/s | ETA: {eta:.0f}s", flush=True)
+            last_log = now
+    return out
+
+
 # ----------------------------------------------------------------------------- tables
 def normalize_records(df: pd.DataFrame, source: str) -> pd.DataFrame:
     """Return one row per record with every normalised view used downstream."""
-    names = pd.DataFrame([normalize_name(x) for x in df["business_name"]], index=df.index)
-    addrs = pd.DataFrame([normalize_address(x) for x in df["business_address"]], index=df.index)
+    src_label = source if isinstance(source, str) else "mixed"
+    names_list = _normalize_series(normalize_name, df["business_name"], f"{src_label} names")
+    addrs_list = _normalize_series(normalize_address, df["business_address"], f"{src_label} addresses")
+    names = pd.DataFrame(names_list, index=df.index)
+    addrs = pd.DataFrame(addrs_list, index=df.index)
     out = pd.concat([df[["entity_id"]].copy(), names, addrs], axis=1)
     out["source"] = source if isinstance(source, str) else list(source)
     out["country_raw"] = df["country"].values

@@ -91,16 +91,22 @@ def train_matcher(X: pd.DataFrame, y: np.ndarray, pair_fold: np.ndarray, cfg: Mo
     t0 = time.time()
     for f in range(n_folds):
         tr, va = pair_fold != f, pair_fold == f
+        if verbose:
+            print(f"[model] Fold {f+1}/{n_folds}: Fitting LightGBM on {tr.sum():,} train pairs (eval on {va.sum():,} val pairs)...", flush=True)
         dtr = lgb.Dataset(X[tr], label=y[tr], free_raw_data=True)
         dva = lgb.Dataset(X[va], label=y[va], reference=dtr, free_raw_data=True)
+        callbacks = [
+            lgb.early_stopping(cfg.early_stopping_rounds, verbose=False),
+            lgb.log_evaluation(period=100) if verbose else lgb.log_evaluation(period=0)
+        ]
         booster = lgb.train(params, dtr, num_boost_round=cfg.num_boost_round, valid_sets=[dva],
-                            callbacks=[lgb.early_stopping(cfg.early_stopping_rounds, verbose=False)])
+                            callbacks=callbacks)
         oof[va] = booster.predict(X[va], num_iteration=booster.best_iteration)
         models.append(booster)
         imps.append(pd.Series(booster.feature_importance("gain"), index=X.columns))
         if verbose:
-            print(f"[model] fold {f}: best_iter={booster.best_iteration}, "
-                  f"AP={average_precision_score(y[va], oof[va]):.4f} ({time.time() - t0:.0f}s)")
+            print(f"[model] fold {f+1}/{n_folds} completed: best_iter={booster.best_iteration}, "
+                  f"AP={average_precision_score(y[va], oof[va]):.4f} ({time.time() - t0:.0f}s)", flush=True)
     matcher = Matcher(feature_names=list(X.columns), models=models)
     imp = pd.concat(imps, axis=1).mean(axis=1).sort_values(ascending=False)
     matcher.importance = (imp / imp.sum()).rename("gain_share").to_frame()

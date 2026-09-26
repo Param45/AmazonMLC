@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -116,8 +116,28 @@ def _knn_blockers(idx: SplitIndex, positions: np.ndarray, cfg: BlockingConfig):
         out_comb = _dense_topk(bn, cfg.combined_k, start)
         return out_name, out_addr, out_comb
 
+    starts = list(range(0, n1, step))
+    total_chunks = len(starts)
+    print(f"[blocking] kNN multi-threaded search: {n1:,} S1 x {nd:,} targets | {total_chunks:,} chunks (chunk size {step})...", flush=True)
+    t0_knn = time.time()
+    last_log = t0_knn
+    parts_dict = {}
+
     with ThreadPoolExecutor(_n_threads(cfg.n_jobs)) as ex:
-        parts = list(ex.map(work, range(0, n1, step)))
+        futures = {ex.submit(work, s): s for s in starts}
+        for done_count, fut in enumerate(as_completed(futures), start=1):
+            s = futures[fut]
+            parts_dict[s] = fut.result()
+            now = time.time()
+            if done_count % 500 == 0 or done_count == total_chunks or (now - last_log >= 15.0):
+                pct = (done_count / total_chunks) * 100
+                elapsed = now - t0_knn
+                rate = done_count / max(elapsed, 0.001)
+                eta = (total_chunks - done_count) / max(rate, 0.001)
+                print(f"[blocking] kNN progress: {done_count:,}/{total_chunks:,} chunks ({pct:.1f}%) | {rate:.1f} chunks/s | ETA: {eta:.0f}s", flush=True)
+                last_log = now
+
+    parts = [parts_dict[s] for s in starts]
     result = []
     for j in range(3):
         rows = np.concatenate([p[j][0] for p in parts])
@@ -224,6 +244,8 @@ def generate_candidates(idx: SplitIndex, cfg: BlockingConfig, verbose: bool = Tr
 
     timing = {}
     for src, pos in idx.source_positions.items():
+        if verbose:
+            print(f"[blocking] Processing target source {src} ({len(pos):,} records)...", flush=True)
         t1 = time.time()
         knn_name, knn_addr, knn_comb = _knn_blockers(idx, pos, cfg)
         add(*knn_name, "b_name")
@@ -231,6 +253,8 @@ def generate_candidates(idx: SplitIndex, cfg: BlockingConfig, verbose: bool = Tr
         add(*knn_comb, "b_comb")
         timing[f"knn_{src}"] = time.time() - t1
         t1 = time.time()
+        if verbose:
+            print(f"[blocking] Running rare token, phonetic key, postal & acronym blockers for {src}...", flush=True)
         add(*_rare_token_blocker(idx, pos, cfg), "b_rare")
         if cfg.use_exact_keys:
             add(*_exact_key_blocker(idx, pos), "b_key")
@@ -242,6 +266,8 @@ def generate_candidates(idx: SplitIndex, cfg: BlockingConfig, verbose: bool = Tr
 
     if not parts_rows:   # no target records at all
         parts_rows, parts_cols, parts_bits = [np.empty(0, np.int64)], [np.empty(0, np.int64)], [np.empty(0, np.int64)]
+    if verbose:
+        print("[blocking] Unioning and deduplicating candidate pairs...", flush=True)
     rows, cols, bits = (np.concatenate(parts_rows), np.concatenate(parts_cols), np.concatenate(parts_bits))
     keys = rows * idx.n_t + cols
     order = np.argsort(keys, kind="stable")

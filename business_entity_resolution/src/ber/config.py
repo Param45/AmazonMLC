@@ -40,7 +40,7 @@ class BlockingConfig:
     keep_top_address: int = 5      # ...and by address similarity alone (only if address cosine >= 0.5)
     min_cheap_score: float = 0.05
     # exact top-k search: cells (S1 rows x targets) per chunk and per thread, and number of threads (-1 = all cores)
-    chunk_cells: int = 4_000_000
+    chunk_cells: int = 15_000_000
     n_jobs: int = -1
 
 
